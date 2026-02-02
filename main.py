@@ -374,7 +374,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             found_repo = None
             words = user_text.split()
             for word in words:
-                clean_word = word.strip("?,.!:'"")
+                clean_word = word.strip("?,.!:'\"")
                 if "/" in clean_word:
                     try:
                         found_repo = await asyncio.to_thread(gh.get_repo, clean_word)
