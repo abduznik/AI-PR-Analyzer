@@ -26,6 +26,32 @@ GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
 INCLUDE_PRIVATE = os.getenv('INCLUDE_PRIVATE', 'false').lower() == 'true'
 TARGET_REPOS = os.getenv('TARGET_REPOS', '').split(',') if os.getenv('TARGET_REPOS') else []
 STATE_FILE = 'reviewed_state.json'
+HISTORY_FILE = 'chat_history.json'
+
+# --- History Management ---
+def load_history():
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, 'r') as f:
+                data = json.load(f)
+                # Migration logic: if value is a list, convert to new structure
+                migrated_data = {}
+                for chat_id, content in data.items():
+                    if isinstance(content, list):
+                        migrated_data[chat_id] = {
+                            "current_session": content,
+                            "saved_sessions": {}
+                        }
+                    else:
+                        migrated_data[chat_id] = content
+                return migrated_data
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+def save_history(history):
+    with open(HISTORY_FILE, 'w') as f:
+        json.dump(history, f, indent=2)
 
 # Initialize Clients
 if not all([GITHUB_TOKEN, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, GOOGLE_API_KEY]):
@@ -170,12 +196,98 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🚀 Manually starting PR check...")
     await run_pr_check(context=context, manual_chat_id=update.effective_chat.id)
 
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Clears the chat history for the user."""
+    chat_id = str(update.effective_chat.id)
+    history = load_history()
+    if chat_id in history:
+        del history[chat_id]
+        save_history(history)
+        await update.message.reply_text("🧹 Chat history cleared!")
+    else:
+        await update.message.reply_text("Chat history is already empty.")
+
+async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Manages chat sessions.
+    Usage:
+    /chat save <name>
+    /chat load <name>
+    /chat remove <name>
+    /chat list
+    """
+    if not context.args:
+        await update.message.reply_text("Usage: /chat [save|load|remove|list] <name>")
+        return
+
+    subcommand = context.args[0].lower()
+    chat_id = str(update.effective_chat.id)
+    history_data = load_history()
+    
+    # Ensure user structure exists
+    if chat_id not in history_data:
+        history_data[chat_id] = {"current_session": [], "saved_sessions": {}}
+    
+    user_data = history_data[chat_id]
+
+    if subcommand == "save":
+        if len(context.args) < 2:
+            await update.message.reply_text("⚠️ Please provide a name to save the session.")
+            return
+        name = context.args[1]
+        # Save a copy of the list
+        user_data["saved_sessions"][name] = list(user_data["current_session"])
+        save_history(history_data)
+        await update.message.reply_text(f"💾 Session saved as '{name}'.")
+
+    elif subcommand == "load":
+        if len(context.args) < 2:
+            await update.message.reply_text("⚠️ Please provide a name to load.")
+            return
+        name = context.args[1]
+        if name in user_data["saved_sessions"]:
+            # Load a copy
+            user_data["current_session"] = list(user_data["saved_sessions"][name])
+            save_history(history_data)
+            await update.message.reply_text(f"📂 Loaded session '{name}'.")
+        else:
+            await update.message.reply_text(f"❌ Session '{name}' not found.")
+
+    elif subcommand == "remove":
+        if len(context.args) < 2:
+            await update.message.reply_text("⚠️ Please provide a name to remove.")
+            return
+        name = context.args[1]
+        if name in user_data["saved_sessions"]:
+            del user_data["saved_sessions"][name]
+            save_history(history_data)
+            await update.message.reply_text(f"🗑️ Session '{name}' removed.")
+        else:
+            await update.message.reply_text(f"❌ Session '{name}' not found.")
+
+    elif subcommand == "list":
+        sessions = list(user_data["saved_sessions"].keys())
+        if sessions:
+            msg = "**Saved Sessions:**\n" + "\n".join([f"- {s}" for s in sessions])
+            await update.message.reply_text(msg, parse_mode="Markdown")
+        else:
+            await update.message.reply_text("No saved sessions found.")
+    
+    else:
+        await update.message.reply_text("Unknown command. Use: save, load, remove, list")
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Uses Gemini to answer user questions, with optional GitHub context.
+    Uses Gemini to answer user questions, with optional GitHub context and chat history.
     """
     user_text = update.message.text
-    logger.info(f"User message: {user_text}")
+    chat_id = str(update.effective_chat.id)
+    logger.info(f"User message ({chat_id}): {user_text}")
+    
+    # Load History
+    history_data = load_history()
+    user_data = history_data.get(chat_id, {"current_session": [], "saved_sessions": {}})
+    user_history = user_data["current_session"]
     
     context_str = ""
     
@@ -187,19 +299,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Helper to find repo
             found_repo = None
             user = await asyncio.to_thread(gh.get_user)
+            user_login = user.login
             
-            # Strategy A: Check for "owner/repo" string directly
+            # Strategy A: Check for "owner/repo" string or just "repo" (assuming self)
             words = user_text.split()
             for word in words:
                 clean_word = word.strip("?,.!:'\"")
+                
+                # Case 1: "owner/repo"
                 if "/" in clean_word:
                     try:
                         found_repo = await asyncio.to_thread(gh.get_repo, clean_word)
-                        break
+                        if found_repo: break
+                    except:
+                        continue
+                
+                # Case 2: "repo" (assume owner is me)
+                else:
+                    try:
+                        # Try to find repo belonging to authenticated user
+                        potential_repo_name = f"{user_login}/{clean_word}"
+                        found_repo = await asyncio.to_thread(gh.get_repo, potential_repo_name)
+                        if found_repo: break
                     except:
                         continue
             
-            # Strategy B: Check against user's owned repos
+            # Strategy B: Check against user's owned repos (fallback for partial matches)
             if not found_repo:
                 # limited to recently updated to avoid API limits on massive accounts
                 repos = await asyncio.to_thread(user.get_repos, type='owner', sort='updated', direction='desc')
@@ -242,15 +367,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Failed fetching context: {e}")
             # Don't crash, just continue to Gemini
 
+    # Format History for Prompt
+    # We keep last 5 exchanges (10 messages)
+    relevant_history = user_history[-10:] 
+    history_str = ""
+    for msg in relevant_history:
+        role = "User" if msg['role'] == 'user' else "Assistant"
+        history_str += f"{role}: {msg['content']}\n"
+
     # 2. Query Gemini
     prompt = f"""
     You are a helpful AI Assistant integrated with the user's GitHub.
-    User Query: {user_text}
     
-    Context Information (if any):
+    **Chat History:**
+    {history_str}
+    
+    **Current User Query:** {user_text}
+    
+    **Context Information (if any):**
     {context_str}
     
     Answer the user. 
+    - Use the chat history to understand context (follow-up questions).
     - If they asked about issues and you have the list, summarize them.
     - If they asked about code, write code. 
     - If context is missing, ask them to specify the repository name.
@@ -258,11 +396,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         response = await asyncio.to_thread(model.generate_content, prompt)
+        reply_text = response.text
+        
         try:
-            await update.message.reply_text(response.text, parse_mode="Markdown")
+            await update.message.reply_text(reply_text, parse_mode="Markdown")
         except Exception as e:
             logger.warning(f"Markdown failed, sending plain text: {e}")
-            await update.message.reply_text(response.text)
+            await update.message.reply_text(reply_text)
+            
+        # Update and Save History
+        user_history.append({"role": "user", "content": user_text})
+        user_history.append({"role": "assistant", "content": reply_text})
+        # Keep only last 20 messages in current session
+        user_data["current_session"] = user_history[-20:]
+        history_data[chat_id] = user_data
+        save_history(history_data)
+        
     except Exception as e:
         await update.message.reply_text(f"Error getting AI response: {e}")
 
@@ -295,6 +444,8 @@ def main():
     # 3. Register Handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("check", check_command))
+    application.add_handler(CommandHandler("clear", clear_command))
+    application.add_handler(CommandHandler("chat", chat_command))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     
     # 4. Run
