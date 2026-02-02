@@ -12,6 +12,7 @@ from github import Github
 import google.generativeai as genai
 from duckduckgo_search import DDGS
 from pydub import AudioSegment
+import speech_recognition as sr
 
 # Configure logging
 logging.basicConfig(
@@ -60,10 +61,8 @@ if not all([GITHUB_TOKEN, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, GOOGLE_API_KEY]):
     exit(1)
 
 genai.configure(api_key=GOOGLE_API_KEY)
-# Using Gemma for text
+# Using Gemma for text (High Quota)
 model = genai.GenerativeModel('gemma-3-27b-it')
-# Using Gemini 2.5 Flash for Multimodal tasks (Audio/Images)
-audio_model = genai.GenerativeModel('gemini-2.5-flash')
 
 gh = Github(GITHUB_TOKEN)
 
@@ -307,48 +306,56 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Error summarizing search: {e}")
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles voice messages, converting OGG to MP3 for Gemini."""
+    """Handles voice messages by transcribing locally and passing to Gemma."""
     try:
         await update.message.chat.send_action(action="record_voice")
         file = await context.bot.get_file(update.message.voice.file_id)
         
         # Paths
         ogg_file = f"voice_{update.effective_chat.id}.ogg"
-        mp3_file = f"voice_{update.effective_chat.id}.mp3"
+        wav_file = f"voice_{update.effective_chat.id}.wav"
         
         # Download
         await file.download_to_drive(ogg_file)
         
-        # Convert OGG to MP3 using Pydub
+        # Convert OGG to WAV using Pydub (SpeechRecognition needs WAV)
         try:
             audio = AudioSegment.from_ogg(ogg_file)
-            audio.export(mp3_file, format="mp3")
-            upload_path = mp3_file
-            mime = "audio/mp3"
+            audio.export(wav_file, format="wav")
         except Exception as conv_err:
-            logger.warning(f"Audio conversion failed (ffmpeg missing?): {conv_err}. Trying raw OGG.")
-            upload_path = ogg_file
-            mime = "audio/ogg"
+            logger.error(f"Audio conversion failed: {conv_err}")
+            await update.message.reply_text("⚠️ Could not process audio format. Install ffmpeg?")
+            if os.path.exists(ogg_file): os.remove(ogg_file)
+            return
 
-        # Upload to Gemini
-        uploaded_file = await asyncio.to_thread(genai.upload_file, path=upload_path, mime_type=mime)
-        
-        # Prompt
-        prompt = "Listen to this audio and reply to the user. If they asked a question, answer it. If they are just talking, converse with them."
-        response = await asyncio.to_thread(audio_model.generate_content, [prompt, uploaded_file])
-        
-        await update.message.reply_text(response.text)
-        
+        # Transcribe
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_file) as source:
+            audio_data = recognizer.record(source)
+            try:
+                # Uses Google Web Speech API (Free, Unofficial, Good for commands)
+                text = recognizer.recognize_google(audio_data)
+                await update.message.reply_text(f"🗣️ *Heard:* \"{text}\"", parse_mode="Markdown")
+                
+                # Hand off to text processor
+                await process_text_message(update, context, override_text=text)
+                
+            except sr.UnknownValueError:
+                await update.message.reply_text("🤔 Could not understand audio.")
+            except sr.RequestError as e:
+                await update.message.reply_text(f"⚠️ Speech Recognition Error: {e}")
+
         # Clean up
         if os.path.exists(ogg_file): os.remove(ogg_file)
-        if os.path.exists(mp3_file): os.remove(mp3_file)
+        if os.path.exists(wav_file): os.remove(wav_file)
         
     except Exception as e:
         logger.error(f"Voice handling error: {e}")
         await update.message.reply_text(f"⚠️ Error processing voice: {e}")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
+async def process_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE, override_text=None):
+    """Unified logic for text and voice-transcribed input."""
+    user_text = override_text if override_text else update.message.text
     chat_id = str(update.effective_chat.id)
     logger.info(f"User message ({chat_id}): {user_text}")
     
@@ -439,6 +446,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_history(history_data)
     except Exception as e:
         await update.message.reply_text(f"Error getting AI response: {e}")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point for text messages."""
+    await process_text_message(update, context)
 
 async def on_startup(application: ApplicationBuilder):
     try:
