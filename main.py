@@ -219,17 +219,6 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Chat history is already empty.")
 
-async def clear_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Completely wipes all chat history for the user."""
-    chat_id = str(update.effective_chat.id)
-    history = load_history()
-    if chat_id in history:
-        del history[chat_id]
-        save_history(history)
-        await update.message.reply_text("🧨 All chat history (including saved sessions) has been obliterated.")
-    else:
-        await update.message.reply_text("You have no history to clear.")
-
 async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /chat [save|load|remove|list] <name>")
@@ -434,13 +423,20 @@ async def process_text_message(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         response = await asyncio.to_thread(model.generate_content, prompt)
         reply_text = response.text
+        bot_msg = None
         try:
-            await update.message.reply_text(reply_text, parse_mode="Markdown")
+            bot_msg = await update.message.reply_text(reply_text, parse_mode="Markdown")
         except:
-            await update.message.reply_text(reply_text)
+            bot_msg = await update.message.reply_text(reply_text)
             
-        user_history.append({"role": "user", "content": user_text})
-        user_history.append({"role": "assistant", "content": reply_text})
+        # Update and Save History with IDs
+        user_msg_id = update.message.message_id
+        bot_msg_id = bot_msg.message_id if bot_msg else None
+        
+        user_history.append({"role": "user", "content": user_text, "id": user_msg_id})
+        if bot_msg_id:
+            user_history.append({"role": "assistant", "content": reply_text, "id": bot_msg_id})
+            
         user_data["current_session"] = user_history[-20:]
         history_data[chat_id] = user_data
         save_history(history_data)
@@ -450,6 +446,42 @@ async def process_text_message(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Entry point for text messages."""
     await process_text_message(update, context)
+
+async def clear_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Wipes chat history and deletes messages from the UI."""
+    chat_id = str(update.effective_chat.id)
+    history_data = load_history()
+    
+    if chat_id in history_data:
+        user_data = history_data[chat_id]
+        session_msgs = user_data.get("current_session", [])
+        
+        # UI Deletion Loop
+        deleted_count = 0
+        status_msg = await update.message.reply_text("🗑️ Clearing chat UI...")
+        
+        for msg in session_msgs:
+            msg_id = msg.get("id")
+            if msg_id:
+                try:
+                    await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+                    deleted_count += 1
+                except Exception as e:
+                    logger.warning(f"Failed to delete msg {msg_id}: {e}")
+                    
+        # Clear Memory
+        del history_data[chat_id]
+        save_history(history_data)
+        
+        # Update status then delete it after 3s
+        try:
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=status_msg.message_id, text=f"✨ Cleared {deleted_count} messages & reset memory.")
+            await asyncio.sleep(3)
+            await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
+        except:
+            pass
+    else:
+        await update.message.reply_text("You have no history to clear.")
 
 async def on_startup(application: ApplicationBuilder):
     try:
