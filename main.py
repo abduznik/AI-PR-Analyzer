@@ -62,8 +62,8 @@ if not all([GITHUB_TOKEN, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, GOOGLE_API_KEY]):
 genai.configure(api_key=GOOGLE_API_KEY)
 # Using Gemma for text
 model = genai.GenerativeModel('gemma-3-27b-it')
-# Using Gemini 2.0 Flash for Native Audio and Multimodal tasks
-audio_model = genai.GenerativeModel('gemini-2.0-flash')
+# Using Gemini 2.5 Flash for Multimodal tasks (Audio/Images)
+audio_model = genai.GenerativeModel('gemini-2.5-flash')
 
 gh = Github(GITHUB_TOKEN)
 
