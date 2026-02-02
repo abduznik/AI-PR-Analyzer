@@ -10,6 +10,8 @@ from telegram import Update, Bot
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 from github import Github
 import google.generativeai as genai
+from duckduckgo_search import DDGS
+from pydub import AudioSegment
 
 # Configure logging
 logging.basicConfig(
@@ -34,7 +36,6 @@ def load_history():
         try:
             with open(HISTORY_FILE, 'r') as f:
                 data = json.load(f)
-                # Migration logic: if value is a list, convert to new structure
                 migrated_data = {}
                 for chat_id, content in data.items():
                     if isinstance(content, list):
@@ -59,8 +60,29 @@ if not all([GITHUB_TOKEN, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, GOOGLE_API_KEY]):
     exit(1)
 
 genai.configure(api_key=GOOGLE_API_KEY)
+# Using Gemma for text
 model = genai.GenerativeModel('gemma-3-27b-it')
+# Using Gemini 2.0 Flash for Native Audio and Multimodal tasks
+audio_model = genai.GenerativeModel('gemini-2.0-flash')
+
 gh = Github(GITHUB_TOKEN)
+
+# --- Helper Functions ---
+
+def perform_web_search(query, max_results=3):
+    """Searches the web using DuckDuckGo."""
+    try:
+        results = DDGS().text(query, max_results=max_results)
+        if not results:
+            return "No results found."
+        
+        formatted_results = ""
+        for r in results:
+            formatted_results += f"- [{r['title']}]({r['href']}): {r['body']}\n"
+        return formatted_results
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        return f"Error performing search: {e}"
 
 # --- State Management ---
 def load_state():
@@ -115,10 +137,6 @@ async def analyze_pr_content(pr, diff_content):
         return "Error analyzing PR with AI."
 
 async def run_pr_check(context: ContextTypes.DEFAULT_TYPE = None, manual_chat_id=None):
-    """
-    Main Logic to check PRs. 
-    Can be triggered by Scheduler (context provided) or Manually (manual_chat_id provided).
-    """
     logger.info("Starting PR Check...")
     chat_id = manual_chat_id if manual_chat_id else TELEGRAM_CHAT_ID
     bot = context.bot if context else Bot(token=TELEGRAM_TOKEN)
@@ -127,7 +145,6 @@ async def run_pr_check(context: ContextTypes.DEFAULT_TYPE = None, manual_chat_id
         state = load_state()
         user = await asyncio.to_thread(gh.get_user)
         
-        # Determine repos
         repos_to_scan = []
         if TARGET_REPOS and TARGET_REPOS[0]:
             for repo_name in TARGET_REPOS:
@@ -137,9 +154,7 @@ async def run_pr_check(context: ContextTypes.DEFAULT_TYPE = None, manual_chat_id
                 except Exception as e:
                     logger.error(f"Could not access {repo_name}: {e}")
         else:
-            # Fetch all owned repos
             all_repos = await asyncio.to_thread(user.get_repos, type='owner', sort='updated', direction='desc')
-            # Convert PaginatedList to list to iterate safely in async
             for repo in all_repos:
                 if not INCLUDE_PRIVATE and repo.private:
                     continue
@@ -155,14 +170,12 @@ async def run_pr_check(context: ContextTypes.DEFAULT_TYPE = None, manual_chat_id
                 pr_id = f"{repo.full_name}#{pr.number}"
                 last_commit = pr.head.sha
                 
-                # If we've seen this commit, skip
                 if state.get(pr_id) == last_commit:
                     continue
                 
                 changes_found = True
                 await bot.send_message(chat_id=chat_id, text=f"🔎 Analyzing new changes in **{repo.full_name}** PR #{pr.number}...", parse_mode="Markdown")
                 
-                # Fetch Diff
                 diff_resp = await asyncio.to_thread(requests.get, pr.diff_url)
                 if diff_resp.status_code != 200:
                     continue
@@ -197,25 +210,28 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await run_pr_check(context=context, manual_chat_id=update.effective_chat.id)
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Clears the chat history for the user."""
+    """Clears the current chat session."""
+    chat_id = str(update.effective_chat.id)
+    history = load_history()
+    if chat_id in history:
+        history[chat_id]["current_session"] = []
+        save_history(history)
+        await update.message.reply_text("🧹 Current chat session cleared!")
+    else:
+        await update.message.reply_text("Chat history is already empty.")
+
+async def clear_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Completely wipes all chat history for the user."""
     chat_id = str(update.effective_chat.id)
     history = load_history()
     if chat_id in history:
         del history[chat_id]
         save_history(history)
-        await update.message.reply_text("🧹 Chat history cleared!")
+        await update.message.reply_text("🧨 All chat history (including saved sessions) has been obliterated.")
     else:
-        await update.message.reply_text("Chat history is already empty.")
+        await update.message.reply_text("You have no history to clear.")
 
 async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Manages chat sessions.
-    Usage:
-    /chat save <name>
-    /chat load <name>
-    /chat remove <name>
-    /chat list
-    """
     if not context.args:
         await update.message.reply_text("Usage: /chat [save|load|remove|list] <name>")
         return
@@ -224,7 +240,6 @@ async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     history_data = load_history()
     
-    # Ensure user structure exists
     if chat_id not in history_data:
         history_data[chat_id] = {"current_session": [], "saved_sessions": {}}
     
@@ -235,7 +250,6 @@ async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Please provide a name to save the session.")
             return
         name = context.args[1]
-        # Save a copy of the list
         user_data["saved_sessions"][name] = list(user_data["current_session"])
         save_history(history_data)
         await update.message.reply_text(f"💾 Session saved as '{name}'.")
@@ -246,7 +260,6 @@ async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         name = context.args[1]
         if name in user_data["saved_sessions"]:
-            # Load a copy
             user_data["current_session"] = list(user_data["saved_sessions"][name])
             save_history(history_data)
             await update.message.reply_text(f"📂 Loaded session '{name}'.")
@@ -276,108 +289,126 @@ async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Unknown command. Use: save, load, remove, list")
 
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Explicitly searches the web and returns a summary."""
+    if not context.args:
+        await update.message.reply_text("Usage: /search <query>")
+        return
+    
+    query = " ".join(context.args)
+    await update.message.chat.send_action(action="typing")
+    results = perform_web_search(query)
+    
+    prompt = f"Summarize these search results for the query '{query}':\n\n{results}"
+    try:
+        response = await asyncio.to_thread(model.generate_content, prompt)
+        await update.message.reply_text(response.text, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"Error summarizing search: {e}")
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles voice messages, converting OGG to MP3 for Gemini."""
+    try:
+        await update.message.chat.send_action(action="record_voice")
+        file = await context.bot.get_file(update.message.voice.file_id)
+        
+        # Paths
+        ogg_file = f"voice_{update.effective_chat.id}.ogg"
+        mp3_file = f"voice_{update.effective_chat.id}.mp3"
+        
+        # Download
+        await file.download_to_drive(ogg_file)
+        
+        # Convert OGG to MP3 using Pydub
+        try:
+            audio = AudioSegment.from_ogg(ogg_file)
+            audio.export(mp3_file, format="mp3")
+            upload_path = mp3_file
+            mime = "audio/mp3"
+        except Exception as conv_err:
+            logger.warning(f"Audio conversion failed (ffmpeg missing?): {conv_err}. Trying raw OGG.")
+            upload_path = ogg_file
+            mime = "audio/ogg"
+
+        # Upload to Gemini
+        uploaded_file = await asyncio.to_thread(genai.upload_file, path=upload_path, mime_type=mime)
+        
+        # Prompt
+        prompt = "Listen to this audio and reply to the user. If they asked a question, answer it. If they are just talking, converse with them."
+        response = await asyncio.to_thread(audio_model.generate_content, [prompt, uploaded_file])
+        
+        await update.message.reply_text(response.text)
+        
+        # Clean up
+        if os.path.exists(ogg_file): os.remove(ogg_file)
+        if os.path.exists(mp3_file): os.remove(mp3_file)
+        
+    except Exception as e:
+        logger.error(f"Voice handling error: {e}")
+        await update.message.reply_text(f"⚠️ Error processing voice: {e}")
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Uses Gemini to answer user questions, with optional GitHub context and chat history.
-    """
     user_text = update.message.text
     chat_id = str(update.effective_chat.id)
     logger.info(f"User message ({chat_id}): {user_text}")
     
-    # Load History
     history_data = load_history()
     user_data = history_data.get(chat_id, {"current_session": [], "saved_sessions": {}})
     user_history = user_data["current_session"]
     
     context_str = ""
     
-    # 1. Check for "issue" context
+    # Check for "search" or "google" or "find" intent to auto-search
+    if any(keyword in user_text.lower() for keyword in ["search for", "google for", "find out about"]):
+        await update.message.chat.send_action(action="typing")
+        search_query = user_text.lower().replace("search for", "").replace("google for", "").replace("find out about", "").strip()
+        search_results = perform_web_search(search_query)
+        context_str += f"**Web Search Results for '{search_query}':**\n{search_results}\n"
+
+    # Check for "issue" context
     if "issue" in user_text.lower():
         try:
             await update.message.chat.send_action(action="typing")
-            
-            # Helper to find repo
-            found_repo = None
             user = await asyncio.to_thread(gh.get_user)
             user_login = user.login
-            
-            # Strategy A: Check for "owner/repo" string or just "repo" (assuming self)
+            found_repo = None
             words = user_text.split()
             for word in words:
-                clean_word = word.strip("?,.!:'\"")
-                
-                # Case 1: "owner/repo"
+                clean_word = word.strip("?,.!:'"")
                 if "/" in clean_word:
                     try:
                         found_repo = await asyncio.to_thread(gh.get_repo, clean_word)
                         if found_repo: break
-                    except:
-                        continue
-                
-                # Case 2: "repo" (assume owner is me)
+                    except: continue
                 else:
                     try:
-                        # Try to find repo belonging to authenticated user
                         potential_repo_name = f"{user_login}/{clean_word}"
                         found_repo = await asyncio.to_thread(gh.get_repo, potential_repo_name)
                         if found_repo: break
-                    except:
-                        continue
+                    except: continue
             
-            # Strategy B: Check against user's owned repos (fallback for partial matches)
-            if not found_repo:
-                # limited to recently updated to avoid API limits on massive accounts
-                repos = await asyncio.to_thread(user.get_repos, type='owner', sort='updated', direction='desc')
-                
-                # We need to iterate carefully. PyGithub PaginatedList is sync.
-                # We'll fetch the first ~30 to check names.
-                def find_in_repos():
-                    count = 0
-                    for r in repos:
-                        if r.name.lower() in user_text.lower():
-                            return r
-                        count += 1
-                        if count > 50: break
-                    return None
-                
-                found_repo = await asyncio.to_thread(find_in_repos)
-
             if found_repo:
-                await update.message.reply_text(f"🔍 Found repository: {found_repo.full_name}. Fetching issues...")
-                
                 issues = await asyncio.to_thread(found_repo.get_issues, state='open')
-                
                 def get_issues_summary():
-                    summary = []
-                    count = 0
+                    summary = []; count = 0
                     for i in issues:
                         if count >= 10: break
-                        summary.append(f"- #{i.number}: {i.title} (assigned: {i.assignee.login if i.assignee else 'None'})")
+                        summary.append(f"- #{i.number}: {i.title}")
                         count += 1
                     return "\n".join(summary)
-                
                 issue_list = await asyncio.to_thread(get_issues_summary)
-                context_str = f"**Open Issues in {found_repo.full_name}:**\n{issue_list}\n"
-            else:
-                 # Optional: Tell user we couldn't find a repo if they specifically asked for issues?
-                 # For now, we just proceed to Gemini without context if no repo matches.
-                 pass
-
+                context_str += f"**Open Issues in {found_repo.full_name}:**\n{issue_list}\n"
         except Exception as e:
             logger.error(f"Failed fetching context: {e}")
-            # Don't crash, just continue to Gemini
 
-    # Format History for Prompt
-    # We keep last 5 exchanges (10 messages)
     relevant_history = user_history[-10:] 
     history_str = ""
     for msg in relevant_history:
         role = "User" if msg['role'] == 'user' else "Assistant"
         history_str += f"{role}: {msg['content']}\n"
 
-    # 2. Query Gemini
     prompt = f"""
-    You are a helpful AI Assistant integrated with the user's GitHub.
+    You are a helpful AI Assistant integrated with GitHub and Web Search.
     
     **Chat History:**
     {history_str}
@@ -388,68 +419,51 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     {context_str}
     
     Answer the user. 
-    - Use the chat history to understand context (follow-up questions).
-    - If they asked about issues and you have the list, summarize them.
+    - Use the search results if available to provide up-to-date information.
+    - If they asked about issues, summarize them.
     - If they asked about code, write code. 
-    - If context is missing, ask them to specify the repository name.
     """
     
     try:
         response = await asyncio.to_thread(model.generate_content, prompt)
         reply_text = response.text
-        
         try:
             await update.message.reply_text(reply_text, parse_mode="Markdown")
-        except Exception as e:
-            logger.warning(f"Markdown failed, sending plain text: {e}")
+        except:
             await update.message.reply_text(reply_text)
             
-        # Update and Save History
         user_history.append({"role": "user", "content": user_text})
         user_history.append({"role": "assistant", "content": reply_text})
-        # Keep only last 20 messages in current session
         user_data["current_session"] = user_history[-20:]
         history_data[chat_id] = user_data
         save_history(history_data)
-        
     except Exception as e:
         await update.message.reply_text(f"Error getting AI response: {e}")
 
 async def on_startup(application: ApplicationBuilder):
-    """
-    Runs once when the bot starts.
-    Sends 'Service is online!', waits 5s, deletes it.
-    """
     try:
-        msg = await application.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🟢 Service is online!")
+        msg = await application.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🟢 AI-PR-Analyzer Online with Web Search & Voice!")
         await asyncio.sleep(5)
         await application.bot.delete_message(chat_id=TELEGRAM_CHAT_ID, message_id=msg.message_id)
     except Exception as e:
-        logger.error(f"Startup message error: {e}")
-
-# --- Main Application ---
+        logger.error(f"Startup error: {e}")
 
 def main():
-    logger.info("Starting AI-PR-Analyzer Bot...")
-    
-    # 1. Setup Scheduler
     scheduler = AsyncIOScheduler()
-    # Schedules: 7am, 1pm (13), 7pm (19)
     scheduler.add_job(run_pr_check, CronTrigger(hour='7,13,19', minute=0))
     scheduler.start()
     
-    # 2. Setup Telegram Bot
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(on_startup).build()
     
-    # 3. Register Handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("check", check_command))
     application.add_handler(CommandHandler("clear", clear_command))
+    application.add_handler(CommandHandler("clearall", clear_all_command))
     application.add_handler(CommandHandler("chat", chat_command))
+    application.add_handler(CommandHandler("search", search_command))
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     
-    # 4. Run
-    # Note: run_polling is blocking, which is what we want for the main process
     application.run_polling()
 
 if __name__ == "__main__":

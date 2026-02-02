@@ -4,3 +4,5 @@ google-generativeai==0.3.2
 python-dotenv==1.0.0
 python-telegram-bot==20.7
 apscheduler==3.10.4
+duckduckgo-search>=5.0.0
+pydub

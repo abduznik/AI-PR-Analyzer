@@ -33,7 +33,7 @@ services:
       - TARGET_REPOS=owner/repo1,owner/repo2
     command: >
       /bin/sh -c "
-      apt-get update && apt-get install -y wget &&
+      apt-get update && apt-get install -y wget ffmpeg &&
       wget -O requirements.txt https://raw.githubusercontent.com/abduznik/AI-PR-Analyzer/refs/heads/main/requirements.txt &&
       wget -O main.py https://raw.githubusercontent.com/abduznik/AI-PR-Analyzer/refs/heads/main/main.py &&
       pip install -r requirements.txt &&
