@@ -493,7 +493,7 @@ async def on_startup(application: ApplicationBuilder):
 
 def main():
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(run_pr_check, CronTrigger(hour='7,13,19', minute=0))
+    scheduler.add_job(run_pr_check, 'interval', minutes=20)
     scheduler.start()
     
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(on_startup).build()
